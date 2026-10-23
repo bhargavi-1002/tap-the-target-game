@@ -1,0 +1,502 @@
+const STORAGE_KEYS = {
+  bestScore: 'tapTargetBestScore',
+  sound: 'tapTargetSoundOn',
+  reducedMotion: 'tapTargetReducedMotion',
+};
+
+const state = {
+  score: 0,
+  hits: 0,
+  timeLeft: 30,
+  bestScore: 0,
+  soundOn: true,
+  reducedMotion: false,
+  currentPhase: 'menu',
+  isPaused: false,
+  timerId: null,
+  countdownId: null,
+  audioContext: null,
+  newestBest: false,
+};
+
+const refs = {
+  menuScreen: document.getElementById('menuScreen'),
+  gameScreen: document.getElementById('gameScreen'),
+  gameBoard: document.getElementById('gameBoard'),
+  target: document.getElementById('target'),
+  scoreDisplay: document.getElementById('scoreDisplay'),
+  timeDisplay: document.getElementById('timeDisplay'),
+  hitsDisplay: document.getElementById('hitsDisplay'),
+  bestScoreDisplay: document.getElementById('bestScoreDisplay'),
+  soundToggle: document.getElementById('soundToggle'),
+  settingsButton: document.getElementById('settingsButton'),
+  playButton: document.getElementById('playButton'),
+  pauseButton: document.getElementById('pauseButton'),
+  pauseOverlay: document.getElementById('pauseOverlay'),
+  countdownOverlay: document.getElementById('countdownOverlay'),
+  gameOverPanel: document.getElementById('gameOverPanel'),
+  finalScoreValue: document.getElementById('finalScoreValue'),
+  bestScoreValue: document.getElementById('bestScoreValue'),
+  finalHitsValue: document.getElementById('finalHitsValue'),
+  celebrationBurst: document.getElementById('celebrationBurst'),
+  resumeButton: document.getElementById('resumeButton'),
+  homeButton: document.getElementById('homeButton'),
+  playAgainButton: document.getElementById('playAgainButton'),
+};
+
+function safeGetNumber(key, fallback) {
+  const storedValue = Number.parseInt(localStorage.getItem(key), 10);
+  return Number.isFinite(storedValue) && storedValue >= 0 ? storedValue : fallback;
+}
+
+function safeGetBoolean(key, fallback) {
+  const rawValue = localStorage.getItem(key);
+  if (rawValue === null) return fallback;
+  return rawValue === 'true';
+}
+
+function loadSavedPreferences() {
+  state.bestScore = safeGetNumber(STORAGE_KEYS.bestScore, 0);
+  state.soundOn = safeGetBoolean(STORAGE_KEYS.sound, true);
+  state.reducedMotion = safeGetBoolean(STORAGE_KEYS.reducedMotion, false);
+  document.body.classList.toggle('reduced-motion', state.reducedMotion);
+}
+
+function saveBestScore() {
+  localStorage.setItem(STORAGE_KEYS.bestScore, String(state.bestScore));
+}
+
+function savePreference(key, value) {
+  localStorage.setItem(key, String(value));
+}
+
+function updateBestDisplay() {
+  refs.bestScoreDisplay.textContent = state.bestScore;
+  refs.bestScoreValue.textContent = state.bestScore;
+}
+
+function updateHUD() {
+  refs.scoreDisplay.textContent = state.score;
+  refs.timeDisplay.textContent = state.timeLeft;
+  refs.hitsDisplay.textContent = state.hits;
+  refs.finalScoreValue.textContent = state.score;
+  refs.finalHitsValue.textContent = state.hits;
+}
+
+function updateSoundToggle() {
+  refs.soundToggle.textContent = state.soundOn ? '🔊' : '🔇';
+  refs.soundToggle.setAttribute('aria-pressed', String(state.soundOn));
+}
+
+function updateSettingsButton() {
+  refs.settingsButton.textContent = state.reducedMotion ? 'Motion: off' : 'Motion: on';
+  refs.settingsButton.setAttribute('aria-pressed', String(state.reducedMotion));
+}
+
+function ensureAudioContext() {
+  if (!state.soundOn) return null;
+
+  const AudioCtor = window.AudioContext || window.webkitAudioContext;
+  if (!AudioCtor) return null;
+
+  if (!state.audioContext) {
+    state.audioContext = new AudioCtor();
+  }
+
+  if (state.audioContext.state === 'suspended') {
+    state.audioContext.resume();
+  }
+
+  return state.audioContext;
+}
+
+function playTone({ frequency = 440, duration = 0.12, type = 'sine', gainValue = 0.05, slide = 0 }) {
+  const context = ensureAudioContext();
+  if (!context) return;
+
+  const oscillator = context.createOscillator();
+  const gainNode = context.createGain();
+  const startTime = context.currentTime;
+
+  oscillator.type = type;
+  oscillator.frequency.setValueAtTime(frequency, startTime);
+  if (slide !== 0) {
+    oscillator.frequency.linearRampToValueAtTime(frequency + slide, startTime + duration);
+  }
+
+  gainNode.gain.setValueAtTime(0.0001, startTime);
+  gainNode.gain.exponentialRampToValueAtTime(gainValue, startTime + 0.01);
+  gainNode.gain.exponentialRampToValueAtTime(0.0001, startTime + duration);
+
+  oscillator.connect(gainNode);
+  gainNode.connect(context.destination);
+  oscillator.start(startTime);
+  oscillator.stop(startTime + duration);
+}
+
+function playHitSound() {
+  playTone({ frequency: 520, duration: 0.12, type: 'triangle', gainValue: 0.06, slide: 120 });
+}
+
+function playGameOverSound() {
+  playTone({ frequency: 260, duration: 0.18, type: 'sawtooth', gainValue: 0.05, slide: -80 });
+  setTimeout(() => {
+    playTone({ frequency: 220, duration: 0.22, type: 'triangle', gainValue: 0.05, slide: -60 });
+  }, 110);
+}
+
+function hideTarget() {
+  refs.target.classList.add('hidden');
+  refs.target.classList.remove('pop-in');
+  refs.target.dataset.active = 'false';
+  refs.target.removeAttribute('style');
+}
+
+function chooseShape() {
+  const shapes = ['circle', 'square', 'triangle', 'diamond'];
+  return shapes[Math.floor(Math.random() * shapes.length)];
+}
+
+function chooseColor() {
+  const palette = ['pink', 'orange', 'yellow', 'cyan', 'green', 'violet'];
+  return palette[Math.floor(Math.random() * palette.length)];
+}
+
+function getSafeTargetSize() {
+  return Math.max(30, Math.min(64, 60 - state.score * 1.25));
+}
+
+function positionTarget() {
+  const boardRect = refs.gameBoard.getBoundingClientRect();
+  const size = getSafeTargetSize();
+  const padding = 18;
+  const maxX = Math.max(padding, boardRect.width - size - padding);
+  const maxY = Math.max(padding, boardRect.height - size - padding);
+  const x = padding + Math.random() * (maxX - padding);
+  const y = padding + Math.random() * (maxY - padding);
+
+  refs.target.style.left = `${x}px`;
+  refs.target.style.top = `${y}px`;
+  refs.target.style.width = `${size}px`;
+  refs.target.style.height = `${size}px`;
+  refs.target.style.setProperty('--target-size', `${size}px`);
+
+  const shape = chooseShape();
+  const color = chooseColor();
+  refs.target.className = `target ${shape} ${color}`;
+  refs.target.classList.remove('hidden');
+  refs.target.classList.add('pop-in');
+  refs.target.dataset.active = 'true';
+}
+
+function spawnTarget() {
+  if (state.currentPhase !== 'playing' || state.isPaused) return;
+  positionTarget();
+  refs.target.focus();
+}
+
+function clearGameTimers() {
+  if (state.timerId) {
+    clearInterval(state.timerId);
+    state.timerId = null;
+  }
+
+  if (state.countdownId) {
+    clearInterval(state.countdownId);
+    state.countdownId = null;
+  }
+}
+
+function updatePauseButtonState() {
+  refs.pauseButton.disabled = state.currentPhase !== 'playing';
+  refs.pauseButton.style.opacity = state.currentPhase === 'playing' ? '1' : '0.6';
+}
+
+function showMenu() {
+  state.currentPhase = 'menu';
+  state.isPaused = false;
+  clearGameTimers();
+  refs.gameScreen.classList.add('hidden');
+  refs.menuScreen.classList.remove('hidden');
+  refs.pauseOverlay.classList.add('hidden');
+  refs.gameOverPanel.classList.add('hidden');
+  refs.countdownOverlay.classList.add('hidden');
+  hideTarget();
+  updatePauseButtonState();
+  updateBestDisplay();
+}
+
+function showGame() {
+  refs.menuScreen.classList.add('hidden');
+  refs.gameScreen.classList.remove('hidden');
+}
+
+function showCountdown() {
+  refs.countdownOverlay.classList.remove('hidden');
+
+  let count = 3;
+  refs.countdownOverlay.textContent = String(count);
+
+  state.countdownId = setInterval(() => {
+    count -= 1;
+
+    if (count > 0) {
+      refs.countdownOverlay.textContent = String(count);
+      playTone({ frequency: 660, duration: 0.09, type: 'triangle', gainValue: 0.05, slide: 90 });
+      return;
+    }
+
+    if (count === 0) {
+      refs.countdownOverlay.textContent = 'GO!';
+      playTone({ frequency: 720, duration: 0.14, type: 'square', gainValue: 0.06, slide: 150 });
+      return;
+    }
+
+    clearInterval(state.countdownId);
+    state.countdownId = null;
+    refs.countdownOverlay.classList.add('hidden');
+    state.currentPhase = 'playing';
+    updatePauseButtonState();
+    startRoundTimer();
+    spawnTarget();
+  }, 800);
+}
+
+function startRoundTimer() {
+  clearInterval(state.timerId);
+  state.timerId = setInterval(() => {
+    if (state.currentPhase !== 'playing') return;
+
+    state.timeLeft = Math.max(0, state.timeLeft - 1);
+    refs.timeDisplay.textContent = state.timeLeft;
+
+    if (state.timeLeft <= 0) {
+      endGame();
+    }
+  }, 1000);
+}
+
+function flashHitBurst(x, y) {
+  const burst = document.createElement('div');
+  burst.className = 'score-popup';
+  burst.textContent = '+1';
+  burst.style.position = 'absolute';
+  burst.style.left = `${x}px`;
+  burst.style.top = `${y}px`;
+  burst.style.transform = 'translate(-50%, -50%)';
+  burst.style.fontWeight = '900';
+  burst.style.color = '#fff3a3';
+  burst.style.fontSize = '1.25rem';
+  burst.style.textShadow = '0 8px 18px rgba(0,0,0,0.22)';
+  burst.style.pointerEvents = 'none';
+  burst.style.zIndex = '20';
+  refs.gameBoard.appendChild(burst);
+
+  setTimeout(() => {
+    burst.remove();
+  }, 500);
+}
+
+function createCelebrationBurst() {
+  if (state.reducedMotion) return;
+
+  const colors = ['#ff7ad9', '#ffd84d', '#58e7ff', '#8dff9d', '#ffb86c', '#b89dff'];
+  for (let index = 0; index < 18; index += 1) {
+    const piece = document.createElement('span');
+    piece.className = 'confetti-piece';
+    piece.style.left = `${50 + (Math.random() * 20 - 10)}%`;
+    piece.style.top = `${40 + (Math.random() * 10 - 5)}%`;
+    piece.style.background = colors[Math.floor(Math.random() * colors.length)];
+    piece.style.setProperty('--x', `${(Math.random() - 0.5) * 170}px`);
+    piece.style.setProperty('--y', `${(Math.random() - 0.5) * 170}px`);
+    piece.style.setProperty('--r', `${(Math.random() * 360) - 180}deg`);
+    refs.celebrationBurst.appendChild(piece);
+
+    setTimeout(() => piece.remove(), 800);
+  }
+}
+
+function handleHit() {
+  if (state.currentPhase !== 'playing' || state.isPaused) return;
+
+  state.score += 1;
+  state.hits += 1;
+  refs.scoreDisplay.textContent = state.score;
+  refs.hitsDisplay.textContent = state.hits;
+
+  if (state.score > state.bestScore) {
+    state.bestScore = state.score;
+    state.newestBest = true;
+    saveBestScore();
+    updateBestDisplay();
+    createCelebrationBurst();
+  }
+
+  const targetRect = refs.target.getBoundingClientRect();
+  const boardRect = refs.gameBoard.getBoundingClientRect();
+  const x = targetRect.left - boardRect.left + targetRect.width / 2;
+  const y = targetRect.top - boardRect.top + targetRect.height / 2;
+  flashHitBurst(x, y);
+
+  if (state.soundOn) {
+    playHitSound();
+  }
+
+  hideTarget();
+  spawnTarget();
+}
+
+function resetRoundState() {
+  state.score = 0;
+  state.hits = 0;
+  state.timeLeft = 30;
+  state.isPaused = false;
+  state.newestBest = false;
+  refs.pauseOverlay.classList.add('hidden');
+  refs.gameOverPanel.classList.add('hidden');
+  refs.celebrationBurst.innerHTML = '';
+  updateHUD();
+  updatePauseButtonState();
+}
+
+function endGame() {
+  state.currentPhase = 'gameover';
+  state.isPaused = false;
+  clearGameTimers();
+  refs.pauseOverlay.classList.add('hidden');
+  refs.gameOverPanel.classList.remove('hidden');
+  refs.finalScoreValue.textContent = state.score;
+  refs.bestScoreValue.textContent = state.bestScore;
+  refs.finalHitsValue.textContent = state.hits;
+  hideTarget();
+
+  if (state.bestScore > 0 && state.newestBest) {
+    createCelebrationBurst();
+  }
+
+  if (state.soundOn) {
+    playGameOverSound();
+  }
+
+  if (state.score > state.bestScore) {
+    state.bestScore = state.score;
+    saveBestScore();
+    updateBestDisplay();
+  }
+}
+
+function startGame() {
+  resetRoundState();
+  showGame();
+  updateBestDisplay();
+  updateHUD();
+  refs.pauseButton.textContent = 'Pause';
+  showCountdown();
+}
+
+function pauseGame() {
+  if (state.currentPhase !== 'playing') return;
+  state.isPaused = true;
+  state.currentPhase = 'paused';
+  refs.pauseOverlay.classList.remove('hidden');
+  refs.pauseButton.textContent = 'Resume';
+  hideTarget();
+}
+
+function resumeGame() {
+  if (state.currentPhase !== 'paused') return;
+  state.isPaused = false;
+  state.currentPhase = 'playing';
+  refs.pauseOverlay.classList.add('hidden');
+  refs.pauseButton.textContent = 'Pause';
+  spawnTarget();
+}
+
+function toggleSound() {
+  state.soundOn = !state.soundOn;
+  savePreference(STORAGE_KEYS.sound, state.soundOn);
+  updateSoundToggle();
+
+  if (state.soundOn) {
+    playTone({ frequency: 700, duration: 0.08, type: 'triangle', gainValue: 0.04, slide: 80 });
+  }
+}
+
+function toggleMotionSetting() {
+  state.reducedMotion = !state.reducedMotion;
+  savePreference(STORAGE_KEYS.reducedMotion, state.reducedMotion);
+  updateSettingsButton();
+  document.body.classList.toggle('reduced-motion', state.reducedMotion);
+}
+
+function bindEvents() {
+  refs.playButton.addEventListener('click', startGame);
+  refs.playAgainButton.addEventListener('click', startGame);
+  refs.homeButton.addEventListener('click', () => {
+    refs.gameOverPanel.classList.add('hidden');
+    refs.countdownOverlay.classList.add('hidden');
+    showMenu();
+  });
+
+  refs.pauseButton.addEventListener('click', () => {
+    if (state.currentPhase === 'playing') {
+      pauseGame();
+    } else if (state.currentPhase === 'paused') {
+      resumeGame();
+    }
+  });
+
+  refs.resumeButton.addEventListener('click', resumeGame);
+  refs.soundToggle.addEventListener('click', toggleSound);
+  refs.settingsButton.addEventListener('click', toggleMotionSetting);
+
+  refs.target.addEventListener('click', (event) => {
+    event.stopPropagation();
+    handleHit();
+  });
+
+  refs.target.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      handleHit();
+    }
+  });
+
+  refs.gameBoard.addEventListener('click', () => {
+    if (state.currentPhase === 'playing') {
+      return;
+    }
+  });
+
+  window.addEventListener('resize', () => {
+    if (state.currentPhase === 'playing' && !state.isPaused) {
+      spawnTarget();
+    }
+  });
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden && state.currentPhase === 'playing') {
+      pauseGame();
+    }
+  });
+}
+
+function init() {
+  loadSavedPreferences();
+  bindEvents();
+  updateBestDisplay();
+  updateHUD();
+  updateSoundToggle();
+  updateSettingsButton();
+  showMenu();
+}
+
+init();
+
+window.addEventListener('error', (event) => {
+  console.error('JavaScript error:', event.error);
+});
+
+window.addEventListener('unhandledrejection', (event) => {
+  console.error('Unhandled promise rejection:', event.reason);
+});
